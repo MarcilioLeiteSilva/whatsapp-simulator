@@ -1,156 +1,182 @@
+# -----------------------------------------------------------------------------
+# whatsapp-simulator — app/main.py
+# -----------------------------------------------------------------------------
 import os
 import time
 import uuid
+import asyncio
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+# -----------------------------------------------------------------------------
+# Config (env)
+# -----------------------------------------------------------------------------
 TARGET_WEBHOOK_URL = os.getenv("TARGET_WEBHOOK_URL", "").strip()
 SIMULATOR_KEY = os.getenv("SIMULATOR_KEY", "").strip()
-DEFAULT_INSTANCE = os.getenv("DEFAULT_INSTANCE", "c1-a1").strip()
 
-app = FastAPI(title="WhatsApp Simulator")
+DEFAULT_INSTANCE = os.getenv("DEFAULT_INSTANCE", "agente001").strip()
+DEFAULT_FROM_NUMBER = os.getenv("DEFAULT_FROM_NUMBER", "5531999999999").strip()
+
+app = FastAPI()
 templates = Jinja2Templates(directory="app/templates")
 
 
-def build_messages_upsert(instance: str, from_number: str, text: str, msg_id: Optional[str] = None):
-    # msg_id controlável para testar dedupe
-    msg_id = msg_id or f"SIM-{uuid.uuid4().hex[:16].upper()}"
-    ts = int(time.time())
-
-    return {
-        "event": "messages.upsert",
-        "instance": instance,
-        "data": {
-            "key": {
-                "remoteJid": f"{from_number}@s.whatsapp.net",
-                "fromMe": False,
-                "id": msg_id,
-                "participant": "",
-                "addressingMode": "pn",
-            },
-            "pushName": "SimUser",
-            "status": "SERVER_ACK",
-            "message": {"conversation": text},
-            "messageType": "conversation",
-            "messageTimestamp": ts,
-            "instanceId": "SIMULATOR",
-            "source": "simulator",
-        },
-        "destination": TARGET_WEBHOOK_URL,
-        "date_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
+def mk_id(prefix: str = "sim") -> str:
+    """Gera message_id controlável (bom para testar dedup)."""
+    return f"{prefix}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
 
-async def post_to_webhook(payload: dict):
+async def send_sim(
+    *,
+    instance: str,
+    from_number: str,
+    text: str,
+    message_id: Optional[str] = None,
+    push_name: str = "Teste",
+    event: str = "messages.upsert",
+    status: str = "MESSAGE",
+):
+    """
+    Envia payload simplificado ao whatsapp-agent-dev /webhook.
+    O whatsapp-agent converte internamente para formato Evolution (DEV-only).
+    """
     if not TARGET_WEBHOOK_URL:
-        return {"ok": False, "error": "TARGET_WEBHOOK_URL não configurado"}
+        raise RuntimeError("TARGET_WEBHOOK_URL não definido")
+
+    payload = {
+        "source": "simulator",
+        "instance": instance,
+        "message_id": message_id or mk_id(),
+        "from_number": from_number,
+        "push_name": push_name,
+        "text": text,
+        "event": event,
+        "status": status,
+    }
 
     headers = {}
     if SIMULATOR_KEY:
         headers["X-SIMULATOR-KEY"] = SIMULATOR_KEY
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(TARGET_WEBHOOK_URL, json=payload, headers=headers)
-        return {"ok": r.status_code < 400, "status_code": r.status_code, "body": r.text[:500]}
+        return r.status_code, r.text
 
 
 @app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
+async def home(req: Request):
     return templates.TemplateResponse(
         "index.html",
         {
-            "request": request,
+            "request": req,
             "target": TARGET_WEBHOOK_URL,
             "default_instance": DEFAULT_INSTANCE,
+            "default_from": DEFAULT_FROM_NUMBER,
         },
     )
 
 
-@app.post("/api/send")
-async def api_send(
+@app.post("/send", response_class=HTMLResponse)
+async def send_form(
+    req: Request,
     instance: str = Form(DEFAULT_INSTANCE),
-    from_number: str = Form("5531999000001"),
+    from_number: str = Form(DEFAULT_FROM_NUMBER),
     text: str = Form("Oi"),
+    push_name: str = Form("Teste"),
 ):
-    payload = build_messages_upsert(instance=instance, from_number=from_number, text=text)
-    result = await post_to_webhook(payload)
-    return JSONResponse({"payload": payload, "result": result})
-
-
-@app.post("/api/scenario/menu")
-async def scenario_menu(
-    instance: str = Form(DEFAULT_INSTANCE),
-    from_number: str = Form("5531999000001"),
-):
-    payload = build_messages_upsert(instance=instance, from_number=from_number, text="Oi")
-    result = await post_to_webhook(payload)
-    return JSONResponse({"scenario": "menu", "result": result})
-
-
-@app.post("/api/scenario/lead3")
-async def scenario_lead3(
-    instance: str = Form(DEFAULT_INSTANCE),
-    from_number: str = Form("5531999000001"),
-):
-    # 3 mensagens: Nome, Telefone, Assunto
-    msgs = [
-        "Nome: João da Silva",
-        "Telefone: 31 99999-0001",
-        "Assunto: Quero atendimento",
-    ]
-    results = []
-    for m in msgs:
-        payload = build_messages_upsert(instance=instance, from_number=from_number, text=m)
-        results.append(await post_to_webhook(payload))
-        time.sleep(0.2)
-    return JSONResponse({"scenario": "lead3", "results": results})
-
-
-@app.post("/api/scenario/lead1")
-async def scenario_lead1(
-    instance: str = Form(DEFAULT_INSTANCE),
-    from_number: str = Form("5531999000001"),
-):
-    payload = build_messages_upsert(
-        instance=instance,
-        from_number=from_number,
-        text="Nome: João da Silva | Telefone: 31 99999-0001 | Assunto: Quero atendimento",
+    code, body = await send_sim(
+        instance=instance.strip(),
+        from_number=from_number.strip(),
+        text=text.strip(),
+        push_name=push_name.strip() or "Teste",
     )
-    result = await post_to_webhook(payload)
-    return JSONResponse({"scenario": "lead1", "result": result})
+
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": req,
+            "target": TARGET_WEBHOOK_URL,
+            "default_instance": instance.strip(),
+            "default_from": from_number.strip(),
+            "result": f"HTTP {code}: {body[:800]}",
+        },
+    )
 
 
-@app.post("/api/scenario/dedupe")
-async def scenario_dedupe(
+@app.post("/scenario/lead3", response_class=HTMLResponse)
+async def scenario_lead3(
+    req: Request,
     instance: str = Form(DEFAULT_INSTANCE),
-    from_number: str = Form("5531999000001"),
+    from_number: str = Form(DEFAULT_FROM_NUMBER),
 ):
-    fixed_id = "SIM-DEDUPE-0001"
-    payload1 = build_messages_upsert(instance=instance, from_number=from_number, text="Oi", msg_id=fixed_id)
-    payload2 = build_messages_upsert(instance=instance, from_number=from_number, text="Oi", msg_id=fixed_id)
+    """
+    Cenário: lead em 3 passos.
+    Ajuste os textos conforme suas rules.py (intenção -> nome -> telefone/assunto).
+    """
+    instance = instance.strip()
+    from_number = from_number.strip()
 
-    r1 = await post_to_webhook(payload1)
-    r2 = await post_to_webhook(payload2)
-    return JSONResponse({"scenario": "dedupe", "results": [r1, r2]})
+    steps = [
+        "Quero atendimento",
+        "Nome: Fulano de Tal",
+        "Telefone: 31999999999\nAssunto: Suporte",
+    ]
+
+    out = []
+    for text in steps:
+        code, _ = await send_sim(instance=instance, from_number=from_number, text=text)
+        out.append(f"{text} -> HTTP {code}")
+        await asyncio.sleep(0.6)
+
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": req,
+            "target": TARGET_WEBHOOK_URL,
+            "default_instance": instance,
+            "default_from": from_number,
+            "result": "\n".join(out),
+        },
+    )
 
 
-@app.post("/api/loadtest")
-async def loadtest(
+@app.post("/scenario/dedup", response_class=HTMLResponse)
+async def scenario_dedup(
+    req: Request,
     instance: str = Form(DEFAULT_INSTANCE),
-    users: int = Form(20),
-    message: str = Form("Oi"),
+    from_number: str = Form(DEFAULT_FROM_NUMBER),
 ):
-    # Dispara N usuários fake com números sequenciais
-    results = []
-    async with httpx.AsyncClient(timeout=20) as client:
-        headers = {"X-SIMULATOR-KEY": SIMULATOR_KEY} if SIMULATOR_KEY else {}
-        for i in range(users):
-            from_number = f"55319990{str(10000+i).zfill(5)}"
-            payload = build_messages_upsert(instance=instance, from_number=from_number, text=message)
-            r = await client.post(TARGET_WEBHOOK_URL, json=payload, headers=headers)
-            results.append({"i": i, "status": r.status_code})
-    return JSONResponse({"scenario": "loadtest", "users": users, "results": results[:50]})
+    """
+    Cenário: dedup.
+    Envia duas vezes o MESMO message_id.
+    """
+    instance = instance.strip()
+    from_number = from_number.strip()
+
+    mid = mk_id("dedup")
+    out = []
+
+    for i in range(2):
+        code, _ = await send_sim(
+            instance=instance,
+            from_number=from_number,
+            text="Oi (dedup)",
+            message_id=mid,
+        )
+        out.append(f"try#{i+1} mid={mid} -> HTTP {code}")
+        await asyncio.sleep(0.3)
+
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": req,
+            "target": TARGET_WEBHOOK_URL,
+            "default_instance": instance,
+            "default_from": from_number,
+            "result": "\n".join(out),
+        },
+    )
